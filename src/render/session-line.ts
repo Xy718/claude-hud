@@ -139,7 +139,7 @@ export function renderSessionLine(ctx: RenderContext): string {
   }
 
   // Usage limits display (shown when enabled in config, respects usageThreshold)
-  if (display?.showUsage !== false && ctx.usageData?.planName && !providerLabel) {
+  if (display?.showUsage !== false && ctx.usageData?.planName && providerLabel !== 'Bedrock') {
     if (ctx.usageData.apiUnavailable) {
       const errorHint = formatUsageError(ctx.usageData.apiError);
       parts.push(warning(`usage: ⚠${errorHint}`, colors));

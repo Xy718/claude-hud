@@ -1190,3 +1190,68 @@ test('render compact layout keeps activity lines even when elementOrder omits th
   assert.ok(output.includes('Read'), 'compact mode should keep tools visible');
   assert.ok(output.includes('todo-marker'), 'compact mode should keep todos visible');
 });
+
+// MiniMax provider tests
+function restoreEnvVar(name, value) {
+  if (value === undefined) {
+    delete process.env[name];
+    return;
+  }
+  process.env[name] = value;
+}
+
+test('renderSessionLine shows MiniMax label and displays usage for MiniMax provider', () => {
+  const savedBase = process.env.ANTHROPIC_BASE_URL;
+  try {
+    process.env.ANTHROPIC_BASE_URL = 'https://api.minimaxi.com/v1';
+    const ctx = baseContext();
+    ctx.usageData = {
+      planName: 'MiniMax',
+      fiveHour: 30,
+      sevenDay: 10,
+      fiveHourResetAt: null,
+      sevenDayResetAt: null,
+    };
+    const line = renderSessionLine(ctx);
+    assert.ok(line.includes('MiniMax'), 'should include MiniMax label');
+    assert.ok(line.includes('5h:'), 'should show usage for MiniMax');
+    assert.ok(line.includes('30%'), 'should show 5h percentage');
+  } finally {
+    restoreEnvVar('ANTHROPIC_BASE_URL', savedBase);
+  }
+});
+
+test('renderUsageLine renders usage for MiniMax provider', () => {
+  const savedBase = process.env.ANTHROPIC_BASE_URL;
+  try {
+    process.env.ANTHROPIC_BASE_URL = 'https://api.minimaxi.com/v1';
+    const ctx = baseContext();
+    ctx.usageData = {
+      planName: 'MiniMax',
+      fiveHour: 45,
+      sevenDay: 20,
+      fiveHourResetAt: null,
+      sevenDayResetAt: null,
+    };
+    const line = renderUsageLine(ctx);
+    assert.ok(line, 'should render usage line for MiniMax');
+    const plain = stripAnsi(line);
+    assert.ok(plain.includes('Usage'), 'should include Usage label');
+    assert.ok(plain.includes('45%'), 'should include 5h percentage');
+  } finally {
+    restoreEnvVar('ANTHROPIC_BASE_URL', savedBase);
+  }
+});
+
+test('renderUsageLine still returns null for Bedrock provider', () => {
+  const ctx = baseContext();
+  ctx.stdin.model = { display_name: 'Sonnet', id: 'anthropic.claude-3-5-sonnet-20240620-v1:0' };
+  ctx.usageData = {
+    planName: 'Max',
+    fiveHour: 23,
+    sevenDay: 45,
+    fiveHourResetAt: null,
+    sevenDayResetAt: null,
+  };
+  assert.equal(renderUsageLine(ctx), null, 'should return null for Bedrock');
+});

@@ -21,6 +21,7 @@ let isNoProxy;
 let getProxyUrl;
 let parseRetryAfterSeconds;
 let USAGE_API_USER_AGENT;
+let isMinimaxEndpoint;
 
 function ensureUsageApiDistIsCurrent() {
   const testDir = path.dirname(fileURLToPath(import.meta.url));
@@ -57,6 +58,7 @@ before(async () => {
     getProxyUrl,
     parseRetryAfterSeconds,
     USAGE_API_USER_AGENT,
+    isMinimaxEndpoint,
   } = await import(`../dist/usage-api.js?cacheBust=${Date.now()}`));
 });
 
@@ -933,6 +935,251 @@ describe('getUsage', () => {
       await new Promise((resolve) => proxyServer.close(() => resolve()));
       restoreEnvVar('HTTPS_PROXY', originalHttpsProxy);
       restoreEnvVar('CLAUDE_HUD_USAGE_TIMEOUT_MS', originalUsageTimeout);
+    }
+  });
+});
+
+describe('isMinimaxEndpoint', () => {
+  test('returns true when ANTHROPIC_BASE_URL contains minimaxi.com', () => {
+    const saved = process.env.ANTHROPIC_BASE_URL;
+    try {
+      process.env.ANTHROPIC_BASE_URL = 'https://api.minimaxi.com/v1';
+      assert.equal(isMinimaxEndpoint(), true);
+    } finally {
+      restoreEnvVar('ANTHROPIC_BASE_URL', saved);
+    }
+  });
+
+  test('returns true when ANTHROPIC_API_BASE_URL contains minimax', () => {
+    const savedBase = process.env.ANTHROPIC_BASE_URL;
+    const savedApiBase = process.env.ANTHROPIC_API_BASE_URL;
+    try {
+      delete process.env.ANTHROPIC_BASE_URL;
+      process.env.ANTHROPIC_API_BASE_URL = 'https://api.minimax.chat/v1';
+      assert.equal(isMinimaxEndpoint(), true);
+    } finally {
+      restoreEnvVar('ANTHROPIC_BASE_URL', savedBase);
+      restoreEnvVar('ANTHROPIC_API_BASE_URL', savedApiBase);
+    }
+  });
+
+  test('returns false when no minimax URL is set', () => {
+    const savedBase = process.env.ANTHROPIC_BASE_URL;
+    const savedApiBase = process.env.ANTHROPIC_API_BASE_URL;
+    try {
+      delete process.env.ANTHROPIC_BASE_URL;
+      delete process.env.ANTHROPIC_API_BASE_URL;
+      assert.equal(isMinimaxEndpoint(), false);
+    } finally {
+      restoreEnvVar('ANTHROPIC_BASE_URL', savedBase);
+      restoreEnvVar('ANTHROPIC_API_BASE_URL', savedApiBase);
+    }
+  });
+
+  test('returns false for non-minimax custom endpoints', () => {
+    const saved = process.env.ANTHROPIC_BASE_URL;
+    try {
+      process.env.ANTHROPIC_BASE_URL = 'https://my-proxy.example.com';
+      assert.equal(isMinimaxEndpoint(), false);
+    } finally {
+      restoreEnvVar('ANTHROPIC_BASE_URL', saved);
+    }
+  });
+});
+
+describe('getUsage with MiniMax endpoint', () => {
+  beforeEach(async () => {
+    tempHome = await createTempHome();
+    clearCache(tempHome);
+  });
+
+  afterEach(async () => {
+    if (tempHome) {
+      await rm(tempHome, { recursive: true, force: true });
+      tempHome = null;
+    }
+  });
+
+  test('routes to MiniMax path when ANTHROPIC_BASE_URL is minimax', async () => {
+    const savedBase = process.env.ANTHROPIC_BASE_URL;
+    const savedAuthToken = process.env.ANTHROPIC_AUTH_TOKEN;
+    try {
+      process.env.ANTHROPIC_BASE_URL = 'https://api.minimaxi.com/v1';
+      process.env.ANTHROPIC_AUTH_TOKEN = 'mm-test-key';
+      let fetchCalls = 0;
+      const result = await getUsage({
+        homeDir: () => tempHome,
+        now: () => 1000,
+        readKeychain: () => null,
+        fetchMiniMaxApi: async (apiKey) => {
+          fetchCalls += 1;
+          assert.equal(apiKey, 'mm-test-key');
+          return buildApiResult();
+        },
+      });
+
+      assert.equal(fetchCalls, 1);
+      assert.equal(result?.planName, 'MiniMax');
+      assert.equal(result?.fiveHour, 25);
+      assert.equal(result?.sevenDay, 10);
+    } finally {
+      restoreEnvVar('ANTHROPIC_BASE_URL', savedBase);
+      restoreEnvVar('ANTHROPIC_AUTH_TOKEN', savedAuthToken);
+    }
+  });
+
+  test('routes to MiniMax path via ANTHROPIC_API_BASE_URL', async () => {
+    const savedBase = process.env.ANTHROPIC_BASE_URL;
+    const savedApiBase = process.env.ANTHROPIC_API_BASE_URL;
+    const savedAuthToken = process.env.ANTHROPIC_AUTH_TOKEN;
+    try {
+      delete process.env.ANTHROPIC_BASE_URL;
+      process.env.ANTHROPIC_API_BASE_URL = 'https://api.minimaxi.com/v1';
+      process.env.ANTHROPIC_AUTH_TOKEN = 'mm-test-key';
+      let fetchCalls = 0;
+      const result = await getUsage({
+        homeDir: () => tempHome,
+        now: () => 1000,
+        readKeychain: () => null,
+        fetchMiniMaxApi: async () => {
+          fetchCalls += 1;
+          return buildApiResult();
+        },
+      });
+
+      assert.equal(fetchCalls, 1);
+      assert.equal(result?.planName, 'MiniMax');
+    } finally {
+      restoreEnvVar('ANTHROPIC_BASE_URL', savedBase);
+      restoreEnvVar('ANTHROPIC_API_BASE_URL', savedApiBase);
+      restoreEnvVar('ANTHROPIC_AUTH_TOKEN', savedAuthToken);
+    }
+  });
+
+  test('MiniMax is not skipped by isUsingCustomApiEndpoint', async () => {
+    const savedBase = process.env.ANTHROPIC_BASE_URL;
+    const savedAuthToken = process.env.ANTHROPIC_AUTH_TOKEN;
+    try {
+      process.env.ANTHROPIC_BASE_URL = 'https://api.minimaxi.com/v1';
+      process.env.ANTHROPIC_AUTH_TOKEN = 'mm-test-key';
+      let fetchCalls = 0;
+      const result = await getUsage({
+        homeDir: () => tempHome,
+        now: () => 1000,
+        readKeychain: () => null,
+        fetchMiniMaxApi: async () => {
+          fetchCalls += 1;
+          return buildApiResult();
+        },
+      });
+      assert.ok(result !== null, 'should not return null for MiniMax endpoint');
+      assert.equal(fetchCalls, 1);
+    } finally {
+      restoreEnvVar('ANTHROPIC_BASE_URL', savedBase);
+      restoreEnvVar('ANTHROPIC_AUTH_TOKEN', savedAuthToken);
+    }
+  });
+
+  test('returns null when MiniMax API key is missing', async () => {
+    const savedBase = process.env.ANTHROPIC_BASE_URL;
+    const savedAuthToken = process.env.ANTHROPIC_AUTH_TOKEN;
+    const savedApiKey = process.env.ANTHROPIC_API_KEY;
+    try {
+      process.env.ANTHROPIC_BASE_URL = 'https://api.minimaxi.com/v1';
+      delete process.env.ANTHROPIC_AUTH_TOKEN;
+      delete process.env.ANTHROPIC_API_KEY;
+      let fetchCalls = 0;
+      const result = await getUsage({
+        homeDir: () => tempHome,
+        now: () => 1000,
+        readKeychain: () => null,
+        fetchMiniMaxApi: async () => {
+          fetchCalls += 1;
+          return buildApiResult();
+        },
+      });
+      assert.equal(result, null);
+      assert.equal(fetchCalls, 0);
+    } finally {
+      restoreEnvVar('ANTHROPIC_BASE_URL', savedBase);
+      restoreEnvVar('ANTHROPIC_AUTH_TOKEN', savedAuthToken);
+      restoreEnvVar('ANTHROPIC_API_KEY', savedApiKey);
+    }
+  });
+
+  test('MiniMax success: returns planName MiniMax with usage data', async () => {
+    const savedBase = process.env.ANTHROPIC_BASE_URL;
+    const savedAuthToken = process.env.ANTHROPIC_AUTH_TOKEN;
+    try {
+      process.env.ANTHROPIC_BASE_URL = 'https://api.minimaxi.com/v1';
+      process.env.ANTHROPIC_AUTH_TOKEN = 'mm-key';
+      const result = await getUsage({
+        homeDir: () => tempHome,
+        now: () => 1000,
+        readKeychain: () => null,
+        fetchMiniMaxApi: async () => ({
+          data: {
+            five_hour: { utilization: 40, resets_at: '2026-01-06T15:00:00Z' },
+            seven_day: { utilization: 15, resets_at: '2026-01-13T00:00:00Z' },
+          },
+        }),
+      });
+      assert.equal(result?.planName, 'MiniMax');
+      assert.equal(result?.fiveHour, 40);
+      assert.equal(result?.sevenDay, 15);
+      assert.ok(result?.fiveHourResetAt instanceof Date);
+      assert.ok(result?.sevenDayResetAt instanceof Date);
+    } finally {
+      restoreEnvVar('ANTHROPIC_BASE_URL', savedBase);
+      restoreEnvVar('ANTHROPIC_AUTH_TOKEN', savedAuthToken);
+    }
+  });
+
+  test('MiniMax failure: returns apiUnavailable when fetch fails', async () => {
+    const savedBase = process.env.ANTHROPIC_BASE_URL;
+    const savedAuthToken = process.env.ANTHROPIC_AUTH_TOKEN;
+    try {
+      process.env.ANTHROPIC_BASE_URL = 'https://api.minimaxi.com/v1';
+      process.env.ANTHROPIC_AUTH_TOKEN = 'mm-key';
+      const result = await getUsage({
+        homeDir: () => tempHome,
+        now: () => 1000,
+        readKeychain: () => null,
+        fetchMiniMaxApi: async () => ({ data: null, error: 'network' }),
+      });
+      assert.equal(result?.planName, 'MiniMax');
+      assert.equal(result?.apiUnavailable, true);
+      assert.equal(result?.apiError, 'network');
+    } finally {
+      restoreEnvVar('ANTHROPIC_BASE_URL', savedBase);
+      restoreEnvVar('ANTHROPIC_AUTH_TOKEN', savedAuthToken);
+    }
+  });
+
+  test('MiniMax reads API key from ANTHROPIC_API_KEY as fallback', async () => {
+    const savedBase = process.env.ANTHROPIC_BASE_URL;
+    const savedAuthToken = process.env.ANTHROPIC_AUTH_TOKEN;
+    const savedApiKey = process.env.ANTHROPIC_API_KEY;
+    try {
+      process.env.ANTHROPIC_BASE_URL = 'https://api.minimaxi.com/v1';
+      delete process.env.ANTHROPIC_AUTH_TOKEN;
+      process.env.ANTHROPIC_API_KEY = 'mm-api-key';
+      let usedKey = null;
+      const result = await getUsage({
+        homeDir: () => tempHome,
+        now: () => 1000,
+        readKeychain: () => null,
+        fetchMiniMaxApi: async (apiKey) => {
+          usedKey = apiKey;
+          return buildApiResult();
+        },
+      });
+      assert.equal(usedKey, 'mm-api-key');
+      assert.equal(result?.planName, 'MiniMax');
+    } finally {
+      restoreEnvVar('ANTHROPIC_BASE_URL', savedBase);
+      restoreEnvVar('ANTHROPIC_AUTH_TOKEN', savedAuthToken);
+      restoreEnvVar('ANTHROPIC_API_KEY', savedApiKey);
     }
   });
 });

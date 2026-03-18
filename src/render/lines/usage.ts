@@ -15,7 +15,8 @@ export function renderUsageLine(ctx: RenderContext): string | null {
     return null;
   }
 
-  if (getProviderLabel(ctx.stdin)) {
+  const providerLabel = getProviderLabel(ctx.stdin);
+  if (providerLabel && providerLabel !== 'MiniMax') {
     return null;
   }
 

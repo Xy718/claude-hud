@@ -58,10 +58,25 @@ const USAGE_API_TIMEOUT_MS_DEFAULT = 15_000;
 export const USAGE_API_USER_AGENT = 'claude-code/2.1';
 
 /**
+ * Check if the configured base URL points to a MiniMax endpoint.
+ */
+export function isMinimaxEndpoint(env: NodeJS.ProcessEnv = process.env): boolean {
+  const baseUrl = env.ANTHROPIC_BASE_URL?.trim() || env.ANTHROPIC_API_BASE_URL?.trim();
+  if (!baseUrl) return false;
+  const lower = baseUrl.toLowerCase();
+  return lower.includes('minimaxi') || lower.includes('minimax');
+}
+
+/**
  * Check if user is using a custom API endpoint instead of the default Anthropic API.
  * When using custom providers (e.g., via cc-switch), the OAuth usage API is not applicable.
+ * MiniMax endpoints are excluded — they have their own usage tracking path.
  */
 function isUsingCustomApiEndpoint(env: NodeJS.ProcessEnv = process.env): boolean {
+  if (isMinimaxEndpoint(env)) {
+    return false;
+  }
+
   const baseUrl = env.ANTHROPIC_BASE_URL?.trim() || env.ANTHROPIC_API_BASE_URL?.trim();
 
   // No custom endpoint configured - using default Anthropic API
@@ -342,6 +357,7 @@ export type UsageApiDeps = {
   now: () => number;
   readKeychain: (now: number, homeDir: string) => { accessToken: string; subscriptionType: string } | null;
   ttls: CacheTtls;
+  fetchMiniMaxApi?: (apiKey: string) => Promise<UsageApiResult>;
 };
 
 const defaultDeps: UsageApiDeps = {
@@ -365,6 +381,12 @@ export async function getUsage(overrides: Partial<UsageApiDeps> = {}): Promise<U
   const deps = { ...defaultDeps, ...overrides };
   const now = deps.now();
   const homeDir = deps.homeDir();
+
+  // MiniMax has its own usage API — handle before the generic custom endpoint check
+  if (isMinimaxEndpoint()) {
+    debug('Detected MiniMax endpoint, using MiniMax usage API');
+    return getMiniMaxUsage(homeDir, deps.now, deps.ttls, deps.fetchMiniMaxApi);
+  }
 
   // Skip usage API if user is using a custom provider
   if (isUsingCustomApiEndpoint()) {
@@ -837,6 +859,224 @@ function parseDate(dateStr: string | undefined): Date | null {
     return null;
   }
   return date;
+}
+
+// --- MiniMax usage support ---
+
+interface MinimaxModelRemains {
+  model_name?: string;
+  current_interval_usage_count?: number;
+  total_count?: number;
+  remains_time?: number; // milliseconds until reset
+  current_weekly_usage_count?: number;
+  weekly_total_count?: number;
+  weekly_remains_time?: number; // milliseconds until weekly reset
+}
+
+interface MinimaxRawResponse {
+  model_remains?: MinimaxModelRemains[];
+  base_resp?: {
+    status_code?: number;
+    status_msg?: string;
+  };
+}
+
+function readMiniMaxApiKey(homeDir: string): string | null {
+  const fromAuthToken = process.env.ANTHROPIC_AUTH_TOKEN?.trim();
+  if (fromAuthToken) return fromAuthToken;
+
+  const fromApiKey = process.env.ANTHROPIC_API_KEY?.trim();
+  if (fromApiKey) return fromApiKey;
+
+  try {
+    const settingsPath = path.join(getClaudeConfigDir(homeDir), 'settings.json');
+    if (!fs.existsSync(settingsPath)) return null;
+    const content = fs.readFileSync(settingsPath, 'utf8');
+    const settings = JSON.parse(content);
+    const envToken = settings?.env?.ANTHROPIC_AUTH_TOKEN?.trim();
+    return envToken || null;
+  } catch {
+    return null;
+  }
+}
+
+function fetchMiniMaxUsage(apiKey: string): Promise<UsageApiResult> {
+  return new Promise((resolve) => {
+    const timeoutMs = getUsageApiTimeoutMs();
+    const options = {
+      hostname: 'www.minimaxi.com',
+      path: '/v1/api/openplatform/coding_plan/remains',
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'User-Agent': USAGE_API_USER_AGENT,
+      },
+      timeout: timeoutMs,
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk: Buffer) => { data += chunk.toString(); });
+      res.on('end', () => {
+        if (res.statusCode !== 200) {
+          debug('MiniMax API returned non-200 status:', res.statusCode);
+          const error = res.statusCode === 429 ? 'rate-limited' : `http-${res.statusCode}`;
+          resolve({ data: null, error });
+          return;
+        }
+
+        try {
+          const raw: MinimaxRawResponse = JSON.parse(data);
+
+          if (raw.base_resp && raw.base_resp.status_code !== 0) {
+            debug('MiniMax API business error:', raw.base_resp.status_msg);
+            resolve({ data: null, error: `minimax-${raw.base_resp.status_code}` });
+            return;
+          }
+
+          const remains = raw.model_remains;
+          if (!remains || remains.length === 0) {
+            resolve({ data: null, error: 'minimax-empty' });
+            return;
+          }
+
+          const modelEnv = process.env.ANTHROPIC_MODEL?.trim()?.toLowerCase();
+          const matched = modelEnv
+            ? remains.find(r => r.model_name?.toLowerCase().includes(modelEnv))
+            : undefined;
+          const entry = matched ?? remains[0];
+
+          const total = entry.total_count ?? 0;
+          const used = entry.current_interval_usage_count ?? 0;
+          const fiveHourUtil = total > 0 ? (used / total) * 100 : 0;
+          const fiveHourResetMs = entry.remains_time;
+          const fiveHourResetAt = (fiveHourResetMs != null && fiveHourResetMs > 0)
+            ? new Date(Date.now() + fiveHourResetMs).toISOString()
+            : undefined;
+
+          const weeklyTotal = entry.weekly_total_count ?? 0;
+          const weeklyUsed = entry.current_weekly_usage_count ?? 0;
+          const sevenDayUtil = weeklyTotal > 0 ? (weeklyUsed / weeklyTotal) * 100 : 0;
+          const weeklyResetMs = entry.weekly_remains_time;
+          const sevenDayResetAt = (weeklyResetMs != null && weeklyResetMs > 0)
+            ? new Date(Date.now() + weeklyResetMs).toISOString()
+            : undefined;
+
+          const apiResponse: UsageApiResponse = {
+            five_hour: { utilization: fiveHourUtil, resets_at: fiveHourResetAt },
+            seven_day: { utilization: sevenDayUtil, resets_at: sevenDayResetAt },
+          };
+
+          resolve({ data: apiResponse });
+        } catch (e) {
+          debug('Failed to parse MiniMax API response:', e);
+          resolve({ data: null, error: 'parse' });
+        }
+      });
+    });
+
+    req.on('error', (error) => {
+      debug('MiniMax API request error:', error);
+      resolve({ data: null, error: 'network' });
+    });
+    req.on('timeout', () => {
+      debug('MiniMax API request timeout');
+      req.destroy();
+      resolve({ data: null, error: 'timeout' });
+    });
+
+    req.end();
+  });
+}
+
+async function getMiniMaxUsage(
+  homeDir: string,
+  nowFn: () => number,
+  ttls: CacheTtls,
+  fetchFn?: (apiKey: string) => Promise<UsageApiResult>,
+): Promise<UsageData | null> {
+  const now = nowFn();
+  const fetcher = fetchFn ?? fetchMiniMaxUsage;
+
+  const cacheState = readCacheState(homeDir, now, ttls);
+  if (cacheState?.isFresh) {
+    return cacheState.data;
+  }
+
+  let holdsCacheLock = false;
+  const lockStatus = tryAcquireCacheLock(homeDir);
+  if (lockStatus === 'busy') {
+    if (cacheState) return cacheState.data;
+    return await waitForFreshCache(homeDir, nowFn, ttls);
+  }
+  holdsCacheLock = lockStatus === 'acquired';
+
+  try {
+    const refreshedCache = readCache(homeDir, nowFn(), ttls);
+    if (refreshedCache) return refreshedCache;
+
+    const apiKey = readMiniMaxApiKey(homeDir);
+    if (!apiKey) {
+      debug('MiniMax API key not found');
+      return null;
+    }
+
+    const apiResult = await fetcher(apiKey);
+    if (!apiResult.data) {
+      const isRateLimited = apiResult.error === 'rate-limited';
+      const prevCount = readRateLimitedCount(homeDir);
+      const rateLimitedCount = isRateLimited ? prevCount + 1 : 0;
+      const backoffOpts: WriteCacheOpts = {
+        rateLimitedCount: isRateLimited ? rateLimitedCount : undefined,
+      };
+
+      const failureResult: UsageData = {
+        planName: 'MiniMax',
+        fiveHour: null,
+        sevenDay: null,
+        fiveHourResetAt: null,
+        sevenDayResetAt: null,
+        apiUnavailable: true,
+        apiError: apiResult.error,
+      };
+
+      if (isRateLimited) {
+        const staleCache = readCacheState(homeDir, now, ttls);
+        const lastGood = readLastGoodData(homeDir);
+        const goodData = (staleCache && !staleCache.data.apiUnavailable) ? staleCache.data : lastGood;
+        if (goodData) {
+          writeCache(homeDir, failureResult, now, { ...backoffOpts, lastGoodData: goodData });
+          return withRateLimitedSyncing(goodData);
+        }
+      }
+
+      writeCache(homeDir, failureResult, now, backoffOpts);
+      return failureResult;
+    }
+
+    const fiveHour = parseUtilization(apiResult.data.five_hour?.utilization);
+    const sevenDay = parseUtilization(apiResult.data.seven_day?.utilization);
+    const fiveHourResetAt = parseDate(apiResult.data.five_hour?.resets_at);
+    const sevenDayResetAt = parseDate(apiResult.data.seven_day?.resets_at);
+
+    const result: UsageData = {
+      planName: 'MiniMax',
+      fiveHour,
+      sevenDay,
+      fiveHourResetAt,
+      sevenDayResetAt,
+    };
+
+    writeCache(homeDir, result, now, { lastGoodData: result });
+    return result;
+  } catch (error) {
+    debug('getMiniMaxUsage failed:', error);
+    return null;
+  } finally {
+    if (holdsCacheLock) {
+      releaseCacheLock(homeDir);
+    }
+  }
 }
 
 export function getUsageApiTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
